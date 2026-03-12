@@ -25,6 +25,8 @@ import random
 import sys
 import time
 import numpy as np
+import csv
+import pandas as pd
 
 import rclpy
 from rclpy.node import Node
@@ -113,6 +115,15 @@ class DQNAgent(Node):
         if not os.path.exists(self.model_dir_path):
             os.makedirs(self.model_dir_path)
 
+        # --- ADD THIS: Persistent Logging Setup ---
+        self.csv_filename = os.path.join(self.model_dir_path, f'training_log_stage{self.stage}.csv')
+
+        # Write CSV headers once (only if the file doesn't exist, or overwrite for a fresh run)
+        if not self.load_model: # If starting fresh
+            with open(self.csv_filename, mode='w', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow(['Episode', 'Total_Reward', 'Steps', 'Epsilon', 'Avg_Max_Q', 'Loss'])
+        
         self.model_path = os.path.join(
             self.model_dir_path,
             f'stage{self.stage}_episode{self.load_episode}.pth'
@@ -143,7 +154,6 @@ class DQNAgent(Node):
 
         # Start Process
         self.process()
-
     def process(self):
         self.env_make()
         time.sleep(1.0)
@@ -156,8 +166,8 @@ class DQNAgent(Node):
             local_step = 0
             score = 0
             sum_max_q = 0.0
+            episode_losses = [] # To track training performance for this episode
             
-            # Start Episode
             done = False
             while not done:
                 local_step += 1
@@ -165,13 +175,11 @@ class DQNAgent(Node):
                 # 1. Action Selection
                 action = int(self.get_action(state))
 
-                # 2. Step Environment (Service Call)
+                # 2. Step Environment
                 next_state, reward, done = self.step(action)
-                
                 score += reward
 
-                # 3. Publish Action/Score for Graphs
-                # We do this before training to visualize real-time
+                # 3. Publish Action/Score for real-time Graphs
                 msg = Float32MultiArray()
                 msg.data = [float(action), float(score), float(reward)]
                 self.action_pub.publish(msg)
@@ -179,8 +187,11 @@ class DQNAgent(Node):
                 # 4. Training Step
                 if self.train_mode:
                     self.append_sample((state, action, reward, next_state, done))
-                    self.train_model(done)
+                    loss_val = self.train_model(done)
                     
+                    if loss_val > 0: # If a batch was actually processed
+                        episode_losses.append(loss_val)
+
                     # Accumulate Max Q for stats
                     with torch.no_grad():
                         state_t = torch.FloatTensor(state).to(self.device)
@@ -192,8 +203,15 @@ class DQNAgent(Node):
                 # 5. Episode End Handling
                 if done:
                     avg_max_q = sum_max_q / local_step if local_step > 0 else 0.0
-                    
-                    # Publish Result for Graphs
+                    avg_loss = np.mean(episode_losses) if episode_losses else 0.0
+
+                    # --- Write to CSV (Only Once) ---
+                    episode_data = [episode, score, local_step, self.epsilon, avg_max_q, avg_loss]
+                    with open(self.csv_filename, mode='a', newline='') as file:
+                        writer = csv.writer(file)
+                        writer.writerow(episode_data)
+
+                    # Publish Result for real-time Graphs
                     res_msg = Float32MultiArray()
                     res_msg.data = [float(score), float(avg_max_q)]
                     self.result_pub.publish(res_msg)
@@ -201,16 +219,13 @@ class DQNAgent(Node):
                     self.get_logger().info(
                         f"Episode: {episode} | Score: {score:.2f} | "
                         f"Steps: {local_step} | Epsilon: {self.epsilon:.4f} | "
-                        f"Memory: {len(self.replay_memory)}"
+                        f"Avg Loss: {avg_loss:.4f}"
                     )
 
-                    # Save Model every 50 episodes
+                    # Save Model every 10 episodes
                     if self.train_mode and episode % 10 == 0:
                         self.save_model(episode)
                     break
-                
-                # Small sleep to prevent busy loop if simulation is slow
-                # time.sleep(0.001) 
 
     def env_make(self):
         while not self.make_environment_client.wait_for_service(timeout_sec=1.0):
@@ -281,7 +296,7 @@ class DQNAgent(Node):
 
     def train_model(self, terminal):
         if len(self.replay_memory) < self.min_replay_memory_size:
-            return
+            return 0.0
 
         # Sample Batch
         batch = random.sample(self.replay_memory, self.batch_size)
@@ -303,18 +318,22 @@ class DQNAgent(Node):
 
         # 3. Compute Loss & Optimize
         loss = self.criterion(current_q, target_q)
-        
+        loss_val = loss.item()   # Extract the float value 
         self.optimizer.zero_grad()
         loss.backward()
         # Gradient clipping for stability
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
 
+        
+        
         # 4. Soft/Hard Target Update
         self.target_update_after_counter += 1
         if self.target_update_after_counter > self.update_target_after and terminal:
             self.update_target_model()
             self.target_update_after_counter = 0
+            
+        return loss_val # Return the value for logging
 
     def save_model(self, episode):
         save_path = os.path.join(
